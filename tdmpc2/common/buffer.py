@@ -8,10 +8,14 @@ class Buffer():
 	"""
 	Replay buffer for TD-MPC2 training. Based on torchrl.
 	Uses CUDA memory if available, and CPU memory otherwise.
+
+	### RPG adjustments: support for batched (multi-environment) training ###
+	author: @FHunist
 	"""
 
 	def __init__(self, cfg):
 		self.cfg = cfg
+		self._num_envs = cfg.num_envs
 		self._device = torch.device('cuda:0')
 		self._capacity = min(cfg.buffer_size, cfg.steps)
 		self._sampler = SliceSampler(
@@ -34,6 +38,11 @@ class Buffer():
 	def num_eps(self):
 		"""Return the number of episodes in the buffer."""
 		return self._num_eps
+	
+	@property
+	def num_envs(self):
+		"""Return the number of environments."""
+		return self._num_envs
 
 	def _reserve_buffer(self, storage):
 		"""
@@ -83,12 +92,56 @@ class Buffer():
 
 	def add(self, td):
 		"""Add an episode to the buffer."""
+
+		# Check for vectorized environments
+		print("Adding episode to buffer...")
+		# is_vectorized = self._num_envs > 1 and td['reward'].shape[1] == self._num_envs and td['reward'].ndim > 1
+		# if is_vectorized:
+		# 	return self._add_vectorized(td)
+
 		td['episode'] = torch.full_like(td['reward'], self._num_eps, dtype=torch.int64)
 		if self._num_eps == 0:
 			self._buffer = self._init(td)
 		self._buffer.extend(td)
 		self._num_eps += 1
 		return self._num_eps
+	
+	def _add_vectorized(self, td):
+		"""Add multiple vectorized episodes to the buffer, one for each environment.
+		
+		Args:
+			td: TensorDict of shape [episode_length, num_envs, ...].
+
+		Returns:
+			int: The number of episodes in the buffer.
+		"""
+		episode_length = td['reward'].shape[0]
+
+		# Extract each environment's trajectory and add to buffer
+		for env_idx in range(self._num_envs):
+			env_td = {}
+			for key, val in td.items():
+				if key == 'episode': continue # Skip, set ourselves
+				if val.ndim > 1 and val.shape[1] == self._num_envs:
+					env_td[key] = val[:, env_idx]
+				else:
+					env_td[key] = val
+			# Create tensordict for this environment
+			env_td = TensorDict(env_td, batch_size=(episode_length,))
+
+			# Assign an episode ID
+			env_td['episode'] = torch.full_like(env_td['reward'], self._num_eps + env_idx, dtype=torch.int64)
+
+			# Initialize buffer if necessary
+			if self._num_eps == 0 and env_idx == 0:
+				self._buffer = self._init(env_td)
+
+			# Add to buffer
+			self._buffer.extend(env_td)
+		
+		self._num_eps += self._num_envs
+		return self._num_eps
+
 
 	def _prepare_batch(self, td):
 		"""

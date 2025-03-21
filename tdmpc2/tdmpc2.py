@@ -13,6 +13,9 @@ class TDMPC2(torch.nn.Module):
 	TD-MPC2 agent. Implements training + inference.
 	Can be used for both single-task and multi-task experiments,
 	and supports both state and pixel observations.
+
+	### RPG adjustments: support for batched (multi-environment) training ###
+	author: @FHunist
 	"""
 
 	def __init__(self, cfg):
@@ -36,6 +39,11 @@ class TDMPC2(torch.nn.Module):
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device='cuda:0'
 		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+
+		# For vecEnv: prev mean for each environment
+		if self.cfg.num_envs > 1:
+			self._prev_means = torch.nn.Buffer(torch.zeros(self.cfg.num_envs, self.cfg.horizon, self.cfg.action_dim, device=self.device))
+		
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -93,7 +101,39 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, t0=False, eval_mode=False, task=None):
+	def act(self, obs, t0=False, eval_mode=False, task=None, env_idx=None):
+		"""
+		Select an action by planning in the latent space of the world model.
+
+		Args:
+			obs (torch.Tensor): Observation from the environment.
+			t0 (bool): Whether this is the first observation in the episode.
+			eval_mode (bool): Whether to use the mean of the action distribution.
+			task (int): Task index (only used for multi-task experiments).
+
+		Returns:
+			torch.Tensor: Action to take in the environment.
+		"""
+		# Add handling for vectorized environments
+		if obs.ndim == 1 or (obs.ndim == 2 and obs.shape[0] == 1): # this might not work if act single expects a batch dimension
+			return self._act_single(obs, t0, eval_mode, task)
+		
+		else:
+			return self._act_vectorized(obs, t0, eval_mode, task, env_idx)
+		
+		# obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+		# if task is not None:
+		# 	task = torch.tensor([task], device=self.device)
+		# if self.cfg.mpc:
+		# 	return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
+		# z = self.model.encode(obs, task)
+		# action, info = self.model.pi(z, task)
+		# if eval_mode:
+		# 	action = info["mean"]
+		# return action[0].cpu()
+
+	@torch.no_grad()
+	def _act_single(self, obs, t0=False, eval_mode=False, task=None):
 		"""
 		Select an action by planning in the latent space of the world model.
 
@@ -110,12 +150,57 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			task = torch.tensor([task], device=self.device)
 		if self.cfg.mpc:
-			return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
+			return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task, env_idx=0).cpu()
 		z = self.model.encode(obs, task)
 		action, info = self.model.pi(z, task)
 		if eval_mode:
 			action = info["mean"]
 		return action[0].cpu()
+	
+	@torch.no_grad()
+	def _act_vectorized(self, obs, t0=False, eval_mode=False, task=None, env_idx=None):
+		"""
+		Select an action by planning in the latent space of the world model.
+
+		Args:
+			obs (torch.Tensor): Observation from the environment.
+			t0 (bool): Whether this is the first observation in the episode.
+			eval_mode (bool): Whether to use the mean of the action distribution.
+			task (int): Task index (only used for multi-task experiments).
+			env_idx (int): Index of the environment in the batch.
+
+		Returns:
+			torch.Tensor: Action to take in the environment.
+		"""
+		num_envs = obs.shape[0]
+		if env_idx is not None:
+			return self._act_single(obs[env_idx], t0, eval_mode, task)
+		
+		# Process all environments
+		obs = obs.to(self.device, non_blocking=True)
+		if task is not None:
+			if isinstance(task, int):
+				task = torch.tensor([task] * num_envs, device=self.device) # not necessary for single-task, but added for completeness (not tested)
+			else:
+				task = task.to(self.device)
+		
+		# Plan for each environment
+		if self.cfg.mpc:
+			actions = []
+			for i in range(num_envs):
+				env_obs = obs[i].unsqueeze(0)
+				env_task = task[i] if task is not None else None
+				action = self.plan(env_obs, t0=t0, eval_mode=eval_mode, task=env_task, env_idx=i)
+				actions.append(action)
+			return torch.stack(actions).cpu() # is .cpu() necessary?
+		else:
+			# use policy
+			z = self.model.encode(obs, task)
+			action, info = self.model.pi(z, task)
+			if eval_mode:
+				action = info["mean"]
+			print("Shape of policy action: ", action.shape)
+			return action.cpu() 
 
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
@@ -131,7 +216,7 @@ class TDMPC2(torch.nn.Module):
 		return G + discount * self.model.Q(z, action, task, return_type='avg')
 
 	@torch.no_grad()
-	def _plan(self, obs, t0=False, eval_mode=False, task=None):
+	def _plan(self, obs, t0=False, eval_mode=False, task=None, env_idx=None):
 		"""
 		Plan a sequence of actions using the learned world model.
 
@@ -140,6 +225,7 @@ class TDMPC2(torch.nn.Module):
 			t0 (bool): Whether this is the first observation in the episode.
 			eval_mode (bool): Whether to use the mean of the action distribution.
 			task (Torch.Tensor): Task index (only used for multi-task experiments).
+			env_idx (int): Index of the environment in the batch. If none, use default.
 
 		Returns:
 			torch.Tensor: Action to take in the environment.
@@ -158,8 +244,13 @@ class TDMPC2(torch.nn.Module):
 		z = z.repeat(self.cfg.num_samples, 1)
 		mean = torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
 		std = torch.full((self.cfg.horizon, self.cfg.action_dim), self.cfg.max_std, dtype=torch.float, device=self.device)
+
+		# use appropriate prev mean for vectorized environments
 		if not t0:
-			mean[:-1] = self._prev_mean[1:]
+			if env_idx is not None and self.cfg.num_envs > 1:
+				mean[:-1] = self._prev_means[env_idx, 1:]
+			else:
+				mean[:-1] = self._prev_mean[1:]
 		actions = torch.empty(self.cfg.horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
 		if self.cfg.num_pi_trajs > 0:
 			actions[:, :self.cfg.num_pi_trajs] = pi_actions
@@ -197,7 +288,13 @@ class TDMPC2(torch.nn.Module):
 		a, std = actions[0], std[0]
 		if not eval_mode:
 			a = a + std * torch.randn(self.cfg.action_dim, device=std.device)
-		self._prev_mean.copy_(mean)
+
+		# store mean for next step - different storage vectorized environments
+		if env_idx is not None and self.cfg.num_envs > 1:
+			self._prev_means[env_idx].copy_(mean)
+		else:
+			self._prev_mean.copy_(mean)
+
 		return a.clamp(-1, 1)
 
 	def update_pi(self, zs, task):
